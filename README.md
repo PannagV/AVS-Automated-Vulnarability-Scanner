@@ -50,7 +50,7 @@ searchsploit --version
 Run from the project directory:
 
 ```bash
-sudo python main.py
+sudo python vscan.py
 ```
 
 > `sudo` is often required for privileged scan types (for example SYN scan).
@@ -124,11 +124,9 @@ vscan > run
 - `searchsploit not found`
 	- Install searchsploit or disable with: `set SEARCHSPLOIT false`
 
-- Command not found due to typo
-	- Use: `python main.py` (not `pythonmain.py`)
 
 ## Project Structure
 
-- `main.py` — interactive console and scanning engine
+- `vscan.py` — interactive console and scanning engine
 - `requirements.txt` — Python dependencies
 - `README.md` — documentation
