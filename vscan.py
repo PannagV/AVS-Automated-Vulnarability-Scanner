@@ -1,5 +1,7 @@
 import cmd
 import json
+import os
+import re
 import shlex
 import shutil
 import socket
@@ -10,6 +12,7 @@ import nmap
 
 
 class VScanScanner:
+    SEARCHSPLOIT_MAX_RESULTS = 3
     SCAN_TYPE_MAP = {
         # Scan techniques
         "syn": "-sS -sV",
@@ -82,6 +85,7 @@ class VScanScanner:
         self.output = None
         self.threads = 10
         self.searchsploit = True
+        self.searchsploit_max_results = self.SEARCHSPLOIT_MAX_RESULTS
         self._searchsploit_available = shutil.which("searchsploit") is not None
         self._searchsploit_warned = False
         self._searchsploit_cache = {}
@@ -95,6 +99,11 @@ class VScanScanner:
         self.output = options.get("OUTPUT")
         self.threads = int(options.get("THREADS", 10))
         self.searchsploit = self._to_bool(options.get("SEARCHSPLOIT", True), default=True)
+        self.searchsploit_max_results = self._to_int(
+            options.get("SEARCHSPLOIT_MAX", self.SEARCHSPLOIT_MAX_RESULTS),
+            default=self.SEARCHSPLOIT_MAX_RESULTS,
+            minimum=1,
+        )
         self.scan_results = {}
         self._searchsploit_cache = {}
 
@@ -111,6 +120,15 @@ class VScanScanner:
         if normalized in {"0", "false", "no", "n", "off", "disable", "disabled"}:
             return False
         return default
+
+    @staticmethod
+    def _to_int(value, default=1, minimum=1):
+        """Parse integer-like values with minimum bound."""
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return default
+        return parsed if parsed >= minimum else default
 
     def resolve_scan_args(self, scan_type):
         """Resolve scan profile to nmap args. Supports custom:<raw nmap args>."""
@@ -200,7 +218,7 @@ class VScanScanner:
                 self._searchsploit_warned = True
             return []
 
-        query = f"{service} {version}".strip()
+        query = self._build_searchsploit_query(service, version)
         if not query:
             return []
 
@@ -231,11 +249,9 @@ class VScanScanner:
             return []
 
         parsed_results = []
-        for key in ("RESULTS_EXPLOIT", "RESULTS_SHELLCODE"):
-            entries = payload.get(key, [])
-            if not isinstance(entries, list):
-                continue
-            for entry in entries[:5]:
+        entries = payload.get("RESULTS_EXPLOIT", [])
+        if isinstance(entries, list):
+            for entry in entries:
                 if not isinstance(entry, dict):
                     continue
                 parsed_results.append(
@@ -246,8 +262,92 @@ class VScanScanner:
                     }
                 )
 
+        parsed_results = self._rank_and_filter_searchsploit(parsed_results, service, version)
+
         self._searchsploit_cache[query] = parsed_results
         return parsed_results
+
+    @staticmethod
+    def _build_searchsploit_query(service, version):
+        """Build focused search query from service/version."""
+        service = (service or "").strip()
+        version = (version or "").strip()
+        if service and version:
+            return f"{service} {version}"
+        return service
+
+    @staticmethod
+    def _sanitize_version_tokens(version):
+        """Extract useful version tokens for relevance scoring."""
+        if not version:
+            return []
+        candidates = re.findall(r"\d+(?:\.\d+)+", version)
+        return candidates[:2]
+
+    def _rank_and_filter_searchsploit(self, matches, service, version):
+        """Deduplicate and keep most relevant searchsploit matches."""
+        service_token = (service or "").strip().lower()
+        version_tokens = self._sanitize_version_tokens(version)
+        unique = {}
+
+        for match in matches:
+            title = (match.get("title") or "").strip()
+            exploit_id = (match.get("exploit_db_id") or "").strip()
+            path = (match.get("path") or "").strip()
+            key = exploit_id or f"{title}|{path}"
+
+            haystack = f"{title} {path}".lower()
+            score = 0
+            if service_token and service_token in haystack:
+                score += 3
+            for token in version_tokens:
+                if token in haystack:
+                    score += 2
+            if "shellcode" in haystack:
+                score -= 2
+            if "dos" in haystack:
+                score -= 1
+
+            normalized = {
+                "title": title,
+                "exploit_db_id": exploit_id,
+                "path": path,
+                "score": score,
+            }
+
+            previous = unique.get(key)
+            if previous is None or normalized["score"] > previous["score"]:
+                unique[key] = normalized
+
+        ranked = sorted(
+            unique.values(),
+            key=lambda item: (item["score"], bool(item["exploit_db_id"]), item["title"]),
+            reverse=True,
+        )
+
+        relevant = [item for item in ranked if item["score"] > 0]
+        selected = relevant or ranked
+        return selected[: self.searchsploit_max_results]
+
+    @staticmethod
+    def _shorten_text(value, max_len=90):
+        """Shorten long strings for readable terminal/text report output."""
+        value = (value or "").strip()
+        if len(value) <= max_len:
+            return value
+        return value[: max_len - 3] + "..."
+
+    @staticmethod
+    def _compact_path(path):
+        """Compact exploit path for display while preserving context."""
+        if not path:
+            return ""
+        normalized = path.replace("\\", "/")
+        base = os.path.basename(normalized)
+        parent = os.path.basename(os.path.dirname(normalized))
+        if parent:
+            return f"{parent}/{base}"
+        return base
 
     def lookup_vulnerability(self, service, version):
         """Lookup known vulnerabilities from a predefined database."""
@@ -348,13 +448,15 @@ class VScanScanner:
                     for vuln in data["vulnerabilities"]:
                         source = vuln.get("source", "lookup")
                         extra = ""
+                        title = self._shorten_text(vuln.get("vulnerability", ""))
                         if source == "searchsploit":
                             exploit_id = vuln.get("exploit_db_id", "")
                             exploit_path = vuln.get("exploit_path", "")
-                            extra = f" [EDB-ID: {exploit_id}] {exploit_path}".strip()
+                            compact_path = self._compact_path(exploit_path)
+                            extra = f" [EDB-ID: {exploit_id}] {compact_path}".strip()
                         report_file.write(
                             f" - {vuln['service']} {vuln['version']} "
-                            f"on port {vuln['port']} ({source}): {vuln['vulnerability']} {extra}\n"
+                            f"on port {vuln['port']} ({source}): {title} {extra}\n"
                         )
                 else:
                     report_file.write("No known vulnerabilities found.\n")
@@ -362,7 +464,7 @@ class VScanScanner:
     def _write_csv_report(self):
         with open(self.output, "w", encoding="utf-8") as report_file:
             report_file.write(
-                "target,ip,proto,port,state,service,version,vulnerability,source,exploit_db_id,exploit_path\n"
+                "target,ip,proto,port,state,service,version,vulnerability,source,exploit_db_id,exploit_path,score\n"
             )
             for target, data in self.scan_results.items():
                 for proto in data["port_info"].all_protocols():
@@ -375,6 +477,7 @@ class VScanScanner:
                         source = ""
                         exploit_db_id = ""
                         exploit_path = ""
+                        score = ""
                         for vuln in data["vulnerabilities"]:
                             if (
                                 vuln.get("port") == port
@@ -385,6 +488,7 @@ class VScanScanner:
                                 source = vuln.get("source", "")
                                 exploit_db_id = vuln.get("exploit_db_id", "")
                                 exploit_path = vuln.get("exploit_path", "")
+                                score = str(vuln.get("score", ""))
                                 break
                         row = [
                             target,
@@ -398,6 +502,7 @@ class VScanScanner:
                             source,
                             exploit_db_id,
                             exploit_path,
+                            score,
                         ]
                         escaped = [value.replace('"', '""') for value in row]
                         report_file.write('"' + '","'.join(escaped) + '"\n')
@@ -431,12 +536,13 @@ class VScanScanner:
                         source = vuln.get("source", "lookup")
                         exploit_id = vuln.get("exploit_db_id", "")
                         exploit_path = vuln.get("exploit_path", "")
+                        title = self._shorten_text(vuln.get("vulnerability", ""), max_len=120)
                         suffix = ""
                         if source == "searchsploit":
-                            suffix = f" [EDB-ID: {exploit_id}] {exploit_path}".strip()
+                            suffix = f" [EDB-ID: {exploit_id}] {self._compact_path(exploit_path)}".strip()
                         report_file.write(
                             f"<li>{vuln['service']} {vuln['version']} on port {vuln['port']}: "
-                            f"{vuln['vulnerability']} ({source}) {suffix}</li>"
+                            f"{title} ({source}) {suffix}</li>"
                         )
                     report_file.write("</ul>")
                 else:
@@ -487,14 +593,15 @@ class VScanScanner:
                 print("Vulnerabilities Found:")
                 for vuln in data["vulnerabilities"]:
                     source = vuln.get("source", "lookup")
+                    title = self._shorten_text(vuln.get("vulnerability", ""))
                     suffix = ""
                     if source == "searchsploit":
                         exploit_id = vuln.get("exploit_db_id", "")
                         exploit_path = vuln.get("exploit_path", "")
-                        suffix = f" [EDB-ID: {exploit_id}] {exploit_path}".strip()
+                        suffix = f" [EDB-ID: {exploit_id}] {self._compact_path(exploit_path)}".strip()
                     print(
                         f" - {vuln['service']} {vuln['version']} "
-                        f"on port {vuln['port']} ({source}): {vuln['vulnerability']} {suffix}"
+                        f"on port {vuln['port']} ({source}): {title} {suffix}"
                     )
             else:
                 print("No known vulnerabilities found.")
@@ -527,6 +634,7 @@ class VScanConsole(cmd.Cmd):
             "OUTPUT": None,
             "THREADS": 10,
             "SEARCHSPLOIT": True,
+            "SEARCHSPLOIT_MAX": 3,
         }
         self.scanner = VScanScanner()
 
@@ -557,7 +665,10 @@ class VScanConsole(cmd.Cmd):
         value = " ".join(parts[1:]).strip()
 
         if option not in self.options:
-            print("[-] Unknown option. Valid options: TARGETS, SCAN_TYPE, PORTS, OUTPUT, THREADS, SEARCHSPLOIT")
+            print(
+                "[-] Unknown option. Valid options: TARGETS, SCAN_TYPE, PORTS, "
+                "OUTPUT, THREADS, SEARCHSPLOIT, SEARCHSPLOIT_MAX"
+            )
             return
 
         if option == "SCAN_TYPE":
@@ -582,6 +693,16 @@ class VScanConsole(cmd.Cmd):
             self.options[option] = None if value.lower() in {"none", "null", "0", ""} else value
         elif option == "SEARCHSPLOIT":
             self.options[option] = VScanScanner._to_bool(value, default=True)
+        elif option == "SEARCHSPLOIT_MAX":
+            try:
+                limit = int(value)
+            except ValueError:
+                print("[-] SEARCHSPLOIT_MAX must be an integer.")
+                return
+            if limit < 1:
+                print("[-] SEARCHSPLOIT_MAX must be greater than 0.")
+                return
+            self.options[option] = limit
         else:
             self.options[option] = value
 

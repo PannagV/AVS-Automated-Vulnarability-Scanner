@@ -11,6 +11,7 @@ It provides a framework-style CLI (`vscan >`) to configure targets, choose scan 
 - Custom Nmap argument support via `custom:<args>`
 - Service/version collection and basic CVE matching from a local lookup table
 - Optional `searchsploit` lookups per discovered service/version
+- Ranked and deduplicated `searchsploit` results for cleaner output
 - Report export to JSON, TXT, CSV, and HTML
 
 ## Important Note
@@ -95,6 +96,11 @@ sudo python vscan.py
 	- Enables/disables searchsploit enrichment for discovered services
 	- Example: `set SEARCHSPLOIT false`
 
+- `SEARCHSPLOIT_MAX` (default: `3`)
+	- Maximum number of ranked searchsploit matches shown per discovered service
+	- Must be an integer greater than `0`
+	- Example: `set SEARCHSPLOIT_MAX 5`
+
 ## Typical Workflow
 
 ```text
@@ -103,6 +109,7 @@ vscan > set SCAN_TYPE syn
 vscan > set PORTS 1-1000
 vscan > set THREADS 5
 vscan > set SEARCHSPLOIT true
+vscan > set SEARCHSPLOIT_MAX 3
 vscan > set OUTPUT report.json
 vscan > run
 ```
@@ -114,6 +121,8 @@ vscan > run
 - Findings may include:
 	- source type (`known-cve` or `searchsploit`)
 	- exploit DB ID and path (when available)
+- Searchsploit entries are filtered and ranked to reduce noisy matches.
+- `SEARCHSPLOIT_MAX` controls how many searchsploit entries are shown per service.
 
 ## Troubleshooting
 
@@ -123,6 +132,9 @@ vscan > run
 
 - `searchsploit not found`
 	- Install searchsploit or disable with: `set SEARCHSPLOIT false`
+
+- Too many / too few exploit suggestions
+	- Tune with: `set SEARCHSPLOIT_MAX <number>`
 
 
 ## Project Structure
